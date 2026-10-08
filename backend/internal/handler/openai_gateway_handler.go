@@ -788,6 +788,8 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		// 从不可变的 canonical forwardBody 派生本次尝试 body 并整块剔除上游私有的加密
 		// reasoning item（含耦合的 id/summary），避免非透传上游 400 拒绝 Kiro reasoning 形态。
 		attemptBody := h.deriveOpenAIForwardAttemptBody(reqLog, forwardBody, account, &passthroughFailoverState)
+		cacheWriteRequest := h.gatewayService.BeginOpenAICacheWriteObservation(c.Request.Context(), account, apiKey.ID, reqModel, sessionHash, attemptBody)
+		defer h.gatewayService.CancelOpenAICacheWriteObservation(cacheWriteRequest)
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
 				if accountReleaseFunc != nil {
@@ -796,6 +798,9 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			}()
 			return h.gatewayService.Forward(c.Request.Context(), c, account, attemptBody)
 		}()
+		if err != nil || result == nil {
+			h.gatewayService.CancelOpenAICacheWriteObservation(cacheWriteRequest)
+		}
 		var cyberBlockBodyHTTP []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyHTTP = sessionHashBody
@@ -813,7 +818,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		}
 		// #5148 对齐：错误返回携带的部分 result（流中断前上游已计量的 usage）照常
 		// 入账；failover 错误恒定 result=nil，不会重复计费。
-		submitResponsesUsage := func(res *service.OpenAIForwardResult) {
+		submitResponsesUsage := func(res *service.OpenAIForwardResult, cacheWriteObservationID string) {
 			if res == nil {
 				return
 			}
@@ -828,23 +833,25 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			cyberBlocked := service.GetOpsCyberPolicy(c) != nil
 			h.submitOpenAIUsageRecordTask(c.Request.Context(), res, func(ctx context.Context) {
 				if err := h.gatewayService.RecordUsage(ctx, &service.OpenAIRecordUsageInput{
-					Result:             res,
-					APIKey:             apiKey,
-					User:               apiKey.User,
-					Account:            account,
-					Subscription:       subscription,
-					InboundEndpoint:    inboundEndpoint,
-					UpstreamEndpoint:   upstreamEndpoint,
-					UserAgent:          userAgent,
-					IPAddress:          clientIP,
-					RequestPayloadHash: requestPayloadHash,
-					APIKeyService:      h.apiKeyService,
-					QuotaPlatform:      quotaPlatform,
-					SessionID:          sessionID,
-					ChannelUsageFields: clientRequestedUsageFields(c, channelMapping, reqModel, res.UpstreamModel),
-					PricingAt:          pricingAt,
-					CyberBlocked:       cyberBlocked,
-					NativeCompactionV2: nativeV2,
+					Result:                  res,
+					APIKey:                  apiKey,
+					User:                    apiKey.User,
+					Account:                 account,
+					Subscription:            subscription,
+					InboundEndpoint:         inboundEndpoint,
+					UpstreamEndpoint:        upstreamEndpoint,
+					UserAgent:               userAgent,
+					IPAddress:               clientIP,
+					RequestPayloadHash:      requestPayloadHash,
+					APIKeyService:           h.apiKeyService,
+					QuotaPlatform:           quotaPlatform,
+					SessionID:               sessionID,
+					CacheWriteObservationID: cacheWriteObservationID,
+					CacheWriteSettingEpoch:  cacheWriteRequestEpoch(cacheWriteRequest),
+					ChannelUsageFields:      clientRequestedUsageFields(c, channelMapping, reqModel, res.UpstreamModel),
+					PricingAt:               pricingAt,
+					CyberBlocked:            cyberBlocked,
+					NativeCompactionV2:      nativeV2,
 				}); err != nil {
 					logger.L().With(
 						zap.String("component", "handler.openai_gateway.responses"),
@@ -863,7 +870,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					zap.Int64("account_id", account.ID),
 					zap.Error(err),
 				)
-				submitResponsesUsage(result)
+				submitResponsesUsage(result, "")
 				return
 			}
 			if failoverClientGone(c) {
@@ -871,7 +878,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					zap.Int64("account_id", account.ID),
 					zap.Error(err),
 				)
-				submitResponsesUsage(result)
+				submitResponsesUsage(result, "")
 				return
 			}
 			if result != nil && result.ImageCount > 0 {
@@ -975,7 +982,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 					zap.Bool("upstream_error_response_already_written", upstreamErrorAlreadyCommunicated),
 					zap.Error(err),
 				}
-				submitResponsesUsage(result)
+				submitResponsesUsage(result, "")
 				if shouldLogOpenAIForwardFailureAsWarn(c, wroteFallback) {
 					reqLog.Warn("openai.forward_failed", fields...)
 					return
@@ -994,8 +1001,14 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, forwardModel, requireCompact, result), openAIForwardSucceededForScheduling(result), nil)
 		}
 
+		// 只有成功完成的请求进入 cache-write lineage。错误/断开路径仍正常记账，
+		// 但不作为下一轮缓存写入推断证据。
+		cacheWriteObservationID := ""
+		if result != nil {
+			cacheWriteObservationID = h.gatewayService.ObserveOpenAICacheWriteTelemetry(c.Request.Context(), account, reqModel, sessionHash, result, cacheWriteRequest)
+		}
 		// 使用量记录通过有界 worker 池提交，避免请求热路径创建无界 goroutine。
-		submitResponsesUsage(result)
+		submitResponsesUsage(result, cacheWriteObservationID)
 		reqLog.Debug("openai.request_completed",
 			zap.Int64("account_id", account.ID),
 			zap.Int("switch_count", switchCount),
@@ -1380,6 +1393,8 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		defaultMappedModel := strings.TrimSpace(effectiveMappedModel)
 		// 应用渠道模型映射到请求体
 		forwardBody := mappedBodyForMessages(channelMappingMsg.Mapped, channelMappingMsg.MappedModel)
+		cacheWriteUnsafeRequest := h.gatewayService.BeginOpenAICacheWriteObservation(c.Request.Context(), account, apiKey.ID, reqModel, sessionHash, nil)
+		defer h.gatewayService.CancelOpenAICacheWriteObservation(cacheWriteUnsafeRequest)
 		writerSizeBeforeForward := c.Writer.Size()
 		result, err := func() (*service.OpenAIForwardResult, error) {
 			defer func() {
@@ -1389,6 +1404,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			}()
 			return h.gatewayService.ForwardAsAnthropic(c.Request.Context(), c, account, forwardBody, promptCacheKey, defaultMappedModel)
 		}()
+		h.gatewayService.CancelOpenAICacheWriteObservation(cacheWriteUnsafeRequest)
 		var cyberBlockBodyMsg []byte
 		if service.GetOpsCyberPolicy(c) != nil {
 			cyberBlockBodyMsg = body
@@ -1407,7 +1423,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		// Forward 与错误一起返回的部分结果：流中断/客户端断开排水前上游已计量的
 		// usage 照常入账，避免上游已产生消耗的请求完全漏记（#5148，对齐 anthropic
 		// 网关同名修复）。failover 错误恒定 result=nil，不会重复计费。
-		submitMessagesUsage := func(res *service.OpenAIForwardResult) {
+		submitMessagesUsage := func(res *service.OpenAIForwardResult, cacheWriteObservationID string) {
 			if res == nil {
 				return
 			}
@@ -1422,22 +1438,23 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			cyberBlocked := service.GetOpsCyberPolicy(c) != nil
 			h.submitOpenAIUsageRecordTask(c.Request.Context(), res, func(ctx context.Context) {
 				if err := h.gatewayService.RecordUsage(ctx, &service.OpenAIRecordUsageInput{
-					Result:             res,
-					APIKey:             apiKey,
-					User:               apiKey.User,
-					Account:            account,
-					Subscription:       subscription,
-					InboundEndpoint:    inboundEndpoint,
-					UpstreamEndpoint:   upstreamEndpoint,
-					UserAgent:          userAgent,
-					IPAddress:          clientIP,
-					RequestPayloadHash: requestPayloadHash,
-					APIKeyService:      h.apiKeyService,
-					QuotaPlatform:      quotaPlatform,
-					SessionID:          sessionID,
-					ChannelUsageFields: clientRequestedUsageFields(c, channelMappingMsg, reqModel, res.UpstreamModel),
-					PricingAt:          pricingAt,
-					CyberBlocked:       cyberBlocked,
+					Result:                  res,
+					APIKey:                  apiKey,
+					User:                    apiKey.User,
+					Account:                 account,
+					Subscription:            subscription,
+					InboundEndpoint:         inboundEndpoint,
+					UpstreamEndpoint:        upstreamEndpoint,
+					UserAgent:               userAgent,
+					IPAddress:               clientIP,
+					RequestPayloadHash:      requestPayloadHash,
+					APIKeyService:           h.apiKeyService,
+					QuotaPlatform:           quotaPlatform,
+					SessionID:               sessionID,
+					CacheWriteObservationID: cacheWriteObservationID,
+					ChannelUsageFields:      clientRequestedUsageFields(c, channelMappingMsg, reqModel, res.UpstreamModel),
+					PricingAt:               pricingAt,
+					CyberBlocked:            cyberBlocked,
 				}); err != nil {
 					logger.L().With(
 						zap.String("component", "handler.openai_gateway.messages"),
@@ -1527,7 +1544,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					)
 					// 断开排水期间上游已计量的 usage 必须入账（此前直接 return 丢弃，
 					// payg 上游照常计费而平台漏记）。
-					submitMessagesUsage(result)
+					submitMessagesUsage(result, "")
 					return
 				}
 				h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, currentRoutingModel, false, result), false, nil, err)
@@ -1537,7 +1554,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 					zap.Bool("fallback_error_response_written", wroteFallback),
 					zap.Error(err),
 				)
-				submitMessagesUsage(result)
+				submitMessagesUsage(result, "")
 				return
 			}
 		}
@@ -1547,7 +1564,9 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 			h.gatewayService.ReportOpenAIAccountScheduleResult(account, openAIAccountScheduleModel(c, account, currentRoutingModel, false, result), true, nil)
 		}
 
-		submitMessagesUsage(result)
+		// Messages does not yet supply the canonical Responses input evidence.
+		// Skip inferred billing instead of treating session affinity as lineage.
+		submitMessagesUsage(result, "")
 		reqLog.Debug("openai_messages.request_completed",
 			zap.Int64("account_id", account.ID),
 			zap.Int("switch_count", switchCount),
@@ -2123,6 +2142,101 @@ func (p *openAIWSTurnPricing) currentOr(fallback time.Time) time.Time {
 		return p.at
 	}
 	return fallback
+}
+
+// openAIWSTurnAPIKeyLookup 是后续 turn 重取 API Key 认证快照的入口
+// （APIKeyService.GetByKey：经 L1/L2 认证缓存，未命中才回源）。
+type openAIWSTurnAPIKeyLookup interface {
+	GetByKey(ctx context.Context, key string) (*service.APIKey, error)
+}
+
+// openAIWSTurnBillingAPIKeys 按 turn 号保存每个 turn 计费用的 API Key 快照。
+//
+// API Key 认证快照只在建连时取一次。若连接内所有 turn 共用它，分组定价（倍率、
+// 高峰、图片定价、利润门参数）会停留在建连时刻：管理员调价后，已打开的长连接
+// 在客户端重连前一直按旧价计费、按旧售价过利润门，而 HTTP 请求每次都经认证缓存
+// 取快照，缓存失效后即生效。
+//
+// 因此后续 turn 在 BeforeTurn（与 HTTP 请求进入认证中间件同位）经同一认证缓存
+// 重取快照，只采用其中的分组，作为该 turn 利润门准入与用量计费共同的分组；用户、
+// Key 限额、订阅仍沿用建连快照。只在同一把 Key、同一分组且平台与订阅类型未变时
+// 采用：Key 换组或分组改平台/订阅类型不是调价，该连接按建连分组调度，继续按建连
+// 快照计费；重取失败同样保留建连快照，不断连。
+//
+// 首轮沿用刚经认证中间件取得的建连快照；没有经过 BeforeTurn 的 turn 回退建连
+// 快照。只保留当前与上一个 turn：下一 turn 的 BeforeTurn 先于上一 turn 的
+// AfterTurn 执行时，上一 turn 仍取到自己的快照。
+type openAIWSTurnBillingAPIKeys struct {
+	mu   sync.Mutex
+	keys map[int]*service.APIKey
+}
+
+// begin 在 BeforeTurn 重装利润门前调用：后续 turn 重取计费分组并按 turn 记下，
+// 返回换入该分组的上下文供本 turn 的利润门使用。
+func (k *openAIWSTurnBillingAPIKeys) begin(ctx context.Context, apiKeyService *service.APIKeyService, turn int, conn *service.APIKey) context.Context {
+	turnKey := conn
+	if turn > 1 && apiKeyService != nil {
+		turnKey = refreshOpenAIWSTurnBillingAPIKey(ctx, apiKeyService, conn)
+	}
+	k.set(turn, turnKey)
+	return withOpenAIWSTurnBillingGroup(ctx, turnKey)
+}
+
+func (k *openAIWSTurnBillingAPIKeys) set(turn int, key *service.APIKey) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if k.keys == nil {
+		k.keys = make(map[int]*service.APIKey, 2)
+	}
+	for t := range k.keys {
+		if t < turn-1 {
+			delete(k.keys, t)
+		}
+	}
+	k.keys[turn] = key
+}
+
+func (k *openAIWSTurnBillingAPIKeys) forTurn(turn int, conn *service.APIKey) *service.APIKey {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if key := k.keys[turn]; key != nil {
+		return key
+	}
+	return conn
+}
+
+// refreshOpenAIWSTurnBillingAPIKey 返回本 turn 计费用的 API Key：分组取当前认证
+// 快照，其余字段与建连快照共享。不满足采用条件时原样返回建连快照。
+func refreshOpenAIWSTurnBillingAPIKey(ctx context.Context, lookup openAIWSTurnAPIKeyLookup, conn *service.APIKey) *service.APIKey {
+	if lookup == nil || conn == nil || conn.Key == "" || conn.GroupID == nil || conn.Group == nil {
+		return conn
+	}
+	latest, err := lookup.GetByKey(ctx, conn.Key)
+	if err != nil || latest == nil || latest.ID != conn.ID || latest.GroupID == nil || *latest.GroupID != *conn.GroupID {
+		return conn
+	}
+	group := latest.Group
+	if group == nil || group.ID != conn.Group.ID ||
+		group.Platform != conn.Group.Platform ||
+		group.SubscriptionType != conn.Group.SubscriptionType {
+		return conn
+	}
+	turnKey := *conn
+	turnKey.Group = group
+	return &turnKey
+}
+
+// withOpenAIWSTurnBillingGroup 把本 turn 的计费分组换进认证分组上下文，使利润门
+// 的售价与本 turn 计费同源。上下文里没有同 ID 的认证分组时不改动。
+func withOpenAIWSTurnBillingGroup(ctx context.Context, turnKey *service.APIKey) context.Context {
+	if turnKey == nil || turnKey.Group == nil {
+		return ctx
+	}
+	current, ok := ctx.Value(ctxkey.Group).(*service.Group)
+	if !ok || current == nil || current == turnKey.Group || current.ID != turnKey.Group.ID {
+		return ctx
+	}
+	return context.WithValue(ctx, ctxkey.Group, turnKey.Group)
 }
 
 // recordOpenAIProfitVeto 记录 OpenAI 侧选号循环的一次利润门终检否决：把账号
@@ -2856,10 +2970,39 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn 级定价：首轮回退到 TurnStarted 的所属 turn 时刻；后续 turn 由
 		// BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号。
 		var turnPricing openAIWSTurnPricing
+		// 后续 turn 的计费分组同样在 BeforeTurn 经认证缓存重取，使分组调价对
+		// 已打开的连接生效。
+		var turnBillingAPIKeys openAIWSTurnBillingAPIKeys
 		// Passthrough ingress does not invoke BeforeTurn for the first frame.
 		if err := checkSimpleModeTurnBilling(); err != nil {
 			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 			return
+		}
+		var cacheWriteRequests sync.Map // turn -> *service.OpenAICacheWriteRequest
+		cancelCacheWriteRequests := func() {
+			cacheWriteRequests.Range(func(turn, _ any) bool {
+				if value, ok := cacheWriteRequests.LoadAndDelete(turn); ok {
+					if receipt, ok := value.(*service.OpenAICacheWriteRequest); ok {
+						h.gatewayService.CancelOpenAICacheWriteObservation(receipt)
+					}
+				}
+				return true
+			})
+		}
+		defer cancelCacheWriteRequests()
+		beginCacheWriteRequest := func(turn int, payload []byte, originalModel string) {
+			if old, ok := cacheWriteRequests.LoadAndDelete(turn); ok {
+				if receipt, ok := old.(*service.OpenAICacheWriteRequest); ok {
+					h.gatewayService.CancelOpenAICacheWriteObservation(receipt)
+				}
+			}
+			cacheWriteModel := strings.TrimSpace(originalModel)
+			if cacheWriteModel == "" {
+				cacheWriteModel = reqModel
+			}
+			if receipt := h.gatewayService.BeginOpenAICacheWriteObservation(ctx, account, apiKey.ID, cacheWriteModel, sessionHash, payload); receipt != nil {
+				cacheWriteRequests.Store(turn, receipt)
+			}
 		}
 		hooks := &service.OpenAIWSIngressHooks{
 			ClientLifecycleContext:      clientLifecycleCtx,
@@ -2873,6 +3016,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				c.Set(securityAuditWSTurnContextKey, turn)
 				service.BeginOpsStreamTurn(c, turn)
 				setCyberTurnBody(turn, payload)
+				beginCacheWriteRequest(turn, payload, originalModel)
+
 				// 连接级 cyber session gate 也在 BeforeRequest 先执行，使 native 与
 				// passthrough ingress 都能在 BeforeTurn 及上游写入前无副作用地拒绝。
 				// BeforeTurn 中保留同一检查作为防御式兜底。
@@ -2943,7 +3088,8 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// 长连接跨峰谷/倍率刷新防护：每个 turn 按当前时刻重装门并复核
 				// 当前账号，越线即要求客户端重连重选（连接绑定单一上游账号，
 				// 无法中途换号）。本 turn 的准入与计费共用同一 pricingAt。
-				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(ctx, apiKey.GroupID)
+				turnBillingCtx := turnBillingAPIKeys.begin(ctx, h.apiKeyService, turn, apiKey)
+				turnCtx, turnAt := h.gatewayService.WithOpenAITurnPricingContext(turnBillingCtx, apiKey.GroupID)
 				if _, vetoed, reason := h.gatewayService.ProfitControlVetoLatest(turnCtx, account); vetoed {
 					reqLog.Info("openai.websocket_turn_profit_vetoed",
 						zap.Int("turn", turn),
@@ -2983,6 +3129,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				return checkSimpleModeTurnBilling()
 			},
 			AfterTurn: func(turn int, result *service.OpenAIForwardResult, turnErr error) {
+				var cacheWriteRequest *service.OpenAICacheWriteRequest
+				if receipt, ok := cacheWriteRequests.LoadAndDelete(turn); ok {
+					cacheWriteRequest, _ = receipt.(*service.OpenAICacheWriteRequest)
+				}
+				defer h.gatewayService.CancelOpenAICacheWriteObservation(cacheWriteRequest)
+
 				turnStart := getTurnStart(turn)
 				cyberBlockBody := takeCyberTurnBody(turn)
 				// 每次 attempt 都清 cyber mark；failover 链结束前保留 recorded guard，
@@ -3038,6 +3190,10 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if result == nil {
 					return
 				}
+				cacheWriteObservationID := ""
+				if turnErr == nil {
+					cacheWriteObservationID = h.gatewayService.ObserveOpenAICacheWriteTelemetry(ctx, account, turnRequestedModel, sessionHash, result, cacheWriteRequest)
+				}
 				result.BillingModel = openAIWSTurnBillingModel(result, turnMapping, turnRequestedModel, turnUpstreamModel)
 				reqLog.Debug("openai.websocket_turn_billing",
 					zap.Int("turn", turn),
@@ -3059,25 +3215,28 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				quotaPlatform := service.QuotaPlatform(c.Request.Context(), apiKey)
 				sessionID := service.ExtractClientSessionID(c)
 				turnRecordPricingAt := turnPricing.currentOr(turnStart)
+				turnBillingAPIKey := turnBillingAPIKeys.forTurn(turn, apiKey)
 				cyberBlocked := service.GetOpsCyberPolicy(c) != nil
 				h.submitOpenAIUsageRecordTask(ctx, result, func(taskCtx context.Context) {
 					if err := h.gatewayService.RecordUsage(taskCtx, &service.OpenAIRecordUsageInput{
-						Result:             result,
-						APIKey:             apiKey,
-						User:               apiKey.User,
-						Account:            account,
-						Subscription:       subscription,
-						InboundEndpoint:    inboundEndpoint,
-						UpstreamEndpoint:   upstreamEndpoint,
-						UserAgent:          userAgent,
-						IPAddress:          clientIP,
-						RequestPayloadHash: requestPayloadHash,
-						APIKeyService:      h.apiKeyService,
-						QuotaPlatform:      quotaPlatform,
-						SessionID:          sessionID,
-						ChannelUsageFields: turnUsageFields,
-						PricingAt:          turnRecordPricingAt,
-						CyberBlocked:       cyberBlocked,
+						Result:                  result,
+						APIKey:                  turnBillingAPIKey,
+						User:                    apiKey.User,
+						Account:                 account,
+						Subscription:            subscription,
+						InboundEndpoint:         inboundEndpoint,
+						UpstreamEndpoint:        upstreamEndpoint,
+						UserAgent:               userAgent,
+						IPAddress:               clientIP,
+						RequestPayloadHash:      requestPayloadHash,
+						APIKeyService:           h.apiKeyService,
+						QuotaPlatform:           quotaPlatform,
+						SessionID:               sessionID,
+						CacheWriteObservationID: cacheWriteObservationID,
+						CacheWriteSettingEpoch:  cacheWriteRequestEpoch(cacheWriteRequest),
+						ChannelUsageFields:      turnUsageFields,
+						PricingAt:               turnRecordPricingAt,
+						CyberBlocked:            cyberBlocked,
 					}); err != nil {
 						reqLog.Error("openai.websocket_record_usage_failed",
 							zap.Int64("account_id", account.ID),
@@ -3110,7 +3269,14 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		for {
+			// Ingress modes skip BeforeRequest for their first frame. Admit only
+			// its cache observation here, after handler-level body rewrites, on
+			// every attempt. The forwarder still captures final wire evidence.
+			beginCacheWriteRequest(1, wsFirstMessage, reqModel)
 			err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks)
+			// Dial/admission failures can return without AfterTurn. End pending
+			// receipts before a retry or account switch, not just at disconnect.
+			cancelCacheWriteRequests()
 			if err == nil {
 				reqLog.Info("openai.websocket_ingress_closed", zap.Int64("account_id", account.ID))
 				return
@@ -3156,7 +3322,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 						}
 						currentAccountRelease = wrapReleaseOnDone(ctx, accountRelease)
 					}
-					wsFirstMessage = wsAttemptMessage
+					// A first-turn retry must retain handler-level rewrites such
+					// as removal of a foreign previous_response_id. Only a later
+					// turn's explicit retry payload replaces the prepared frame.
+					if retryCurrentTurn {
+						wsFirstMessage = wsAttemptMessage
+					}
 					continue
 				}
 				if handleWSFailover(account, failoverErr) {

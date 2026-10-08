@@ -95,10 +95,14 @@ func (b AnthropicContentBlock) MarshalJSON() ([]byte, error) {
 			anthropicContentBlock
 		}{Text: b.Text, anthropicContentBlock: anthropicContentBlock(b)})
 	case "thinking":
+		// Anthropic always sends `signature` on thinking blocks (empty on
+		// content_block_start); strict clients such as Grok Build reject the
+		// block with "missing field `signature`" when the key is absent.
 		return json.Marshal(struct {
-			Thinking string `json:"thinking"`
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
 			anthropicContentBlock
-		}{Thinking: b.Thinking, anthropicContentBlock: anthropicContentBlock(b)})
+		}{Thinking: b.Thinking, Signature: b.Signature, anthropicContentBlock: anthropicContentBlock(b)})
 	default:
 		return json.Marshal(base)
 	}
@@ -312,8 +316,9 @@ func (i *ResponsesInputItem) UnmarshalJSON(data []byte) error {
 // ResponsesContentPart is a typed content part in a Responses message.
 type ResponsesContentPart struct {
 	PromptCacheBreakpoint json.RawMessage `json:"prompt_cache_breakpoint,omitempty"`
-	Type                  string          `json:"type"` // "input_text" | "output_text" | "input_image" | "input_file"
+	Type                  string          `json:"type"` // "input_text" | "output_text" | "refusal" | "input_image" | "input_file"
 	Text                  string          `json:"text,omitempty"`
+	Refusal               string          `json:"refusal,omitempty"`   // type=refusal
 	ImageURL              string          `json:"image_url,omitempty"` // data URI for input_image
 
 	// input_file fields.
@@ -506,10 +511,11 @@ type ResponsesSummary struct {
 
 // ResponsesUsage holds token counts in Responses API format.
 type ResponsesUsage struct {
-	InputTokens              int `json:"input_tokens"`
-	OutputTokens             int `json:"output_tokens"`
-	TotalTokens              int `json:"total_tokens"`
-	CacheCreationInputTokens int `json:"cache_creation_input_tokens,omitempty"`
+	InputTokens                     int  `json:"input_tokens"`
+	OutputTokens                    int  `json:"output_tokens"`
+	TotalTokens                     int  `json:"total_tokens"`
+	CacheCreationInputTokens        int  `json:"cache_creation_input_tokens,omitempty"`
+	CacheCreationInputTokensPresent bool `json:"-"`
 
 	// Optional detailed breakdown
 	InputTokensDetails  *ResponsesInputTokensDetails  `json:"input_tokens_details,omitempty"`
@@ -579,10 +585,44 @@ func (u *ResponsesUsage) UnmarshalJSON(data []byte) error {
 	if canonicalCacheCreationTokens != nil {
 		u.CacheCreationInputTokens = max(*canonicalCacheCreationTokens, 0)
 	}
+	u.CacheCreationInputTokensPresent = openAICacheWriteFieldPresentJSON(data)
 	if u.TotalTokens == 0 && (u.InputTokens != 0 || u.OutputTokens != 0) {
 		u.TotalTokens = u.InputTokens + u.OutputTokens
 	}
 	return nil
+}
+
+func openAICacheWriteFieldPresentJSON(data []byte) bool {
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return false
+	}
+	for _, field := range []string{
+		"cache_write_tokens",
+		"cache_creation_input_tokens",
+		"cache_write_input_tokens",
+		"cache_creation_tokens",
+	} {
+		if _, ok := root[field]; ok {
+			return true
+		}
+	}
+	for _, detailsField := range []string{"input_tokens_details", "prompt_tokens_details"} {
+		raw, ok := root[detailsField]
+		if !ok {
+			continue
+		}
+		var details map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &details); err != nil {
+			continue
+		}
+		for _, field := range []string{"cache_write_tokens", "cache_creation_tokens"} {
+			if _, ok := details[field]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ResponsesInputTokensDetails breaks down input token usage.
@@ -690,6 +730,7 @@ type ChatStreamOptions struct {
 type ChatMessage struct {
 	Role             string          `json:"role"` // "system" | "user" | "assistant" | "tool" | "function"
 	Content          json.RawMessage `json:"content,omitempty"`
+	Refusal          string          `json:"refusal,omitempty"`
 	ReasoningContent string          `json:"reasoning_content,omitempty"`
 	Reasoning        string          `json:"reasoning,omitempty"`
 	Name             string          `json:"name,omitempty"`
@@ -830,6 +871,7 @@ type ChatChunkChoice struct {
 type ChatDelta struct {
 	Role             string         `json:"role,omitempty"`
 	Content          *string        `json:"content,omitempty"` // pointer: omit when not present, null vs "" matters
+	Refusal          *string        `json:"refusal,omitempty"`
 	ReasoningContent *string        `json:"reasoning_content,omitempty"`
 	Reasoning        *string        `json:"reasoning,omitempty"`
 	ToolCalls        []ChatToolCall `json:"tool_calls,omitempty"`

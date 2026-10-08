@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
 	pkghttputil "github.com/Wei-Shaw/sub2api/internal/pkg/httputil"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/xai"
@@ -1263,10 +1264,13 @@ func TestOpenAIResponsesWebSocket_PreviousResponseIDKindLoggedBeforeAcquireFailu
 }
 
 type contentModerationHandlerSettingRepo struct {
+	mu     sync.RWMutex
 	values map[string]string
 }
 
 func (r *contentModerationHandlerSettingRepo) Get(ctx context.Context, key string) (*service.Setting, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if value, ok := r.values[key]; ok {
 		return &service.Setting{Key: key, Value: value}, nil
 	}
@@ -1274,6 +1278,8 @@ func (r *contentModerationHandlerSettingRepo) Get(ctx context.Context, key strin
 }
 
 func (r *contentModerationHandlerSettingRepo) GetValue(ctx context.Context, key string) (string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	if value, ok := r.values[key]; ok {
 		return value, nil
 	}
@@ -1281,6 +1287,8 @@ func (r *contentModerationHandlerSettingRepo) GetValue(ctx context.Context, key 
 }
 
 func (r *contentModerationHandlerSettingRepo) Set(ctx context.Context, key, value string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.values == nil {
 		r.values = map[string]string{}
 	}
@@ -1289,6 +1297,8 @@ func (r *contentModerationHandlerSettingRepo) Set(ctx context.Context, key, valu
 }
 
 func (r *contentModerationHandlerSettingRepo) GetMultiple(ctx context.Context, keys []string) (map[string]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := map[string]string{}
 	for _, key := range keys {
 		if value, ok := r.values[key]; ok {
@@ -1299,6 +1309,8 @@ func (r *contentModerationHandlerSettingRepo) GetMultiple(ctx context.Context, k
 }
 
 func (r *contentModerationHandlerSettingRepo) SetMultiple(ctx context.Context, settings map[string]string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.values == nil {
 		r.values = map[string]string{}
 	}
@@ -1309,6 +1321,8 @@ func (r *contentModerationHandlerSettingRepo) SetMultiple(ctx context.Context, s
 }
 
 func (r *contentModerationHandlerSettingRepo) GetAll(ctx context.Context) (map[string]string, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	out := make(map[string]string, len(r.values))
 	for key, value := range r.values {
 		out[key] = value
@@ -1317,6 +1331,8 @@ func (r *contentModerationHandlerSettingRepo) GetAll(ctx context.Context) (map[s
 }
 
 func (r *contentModerationHandlerSettingRepo) Delete(ctx context.Context, key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	delete(r.values, key)
 	return nil
 }
@@ -1948,6 +1964,12 @@ type openAIResponsesWSUsageLogCase struct {
 	afterFirstUpstreamRequest func(channelSvc *service.ChannelService) error
 	// group 覆盖 apiKey.Group（分组级模型白名单测试用）；nil 保持原有无分组行为。
 	group *service.Group
+	// apiKeyService 非 nil 时模拟 API Key 认证中间件：连接认证快照经它按
+	// apiKeyCredential 取得，并把其分组放入请求 ctx；handler 也使用它。
+	apiKeyService    *service.APIKeyService
+	apiKeyCredential string
+	// accountRateMultiplier 覆盖账号倍率（利润门测试用）。
+	accountRateMultiplier *float64
 	// firstFrameCloseExpected：首帧即被拒（连接被 1008 关闭），不期待任何响应帧。
 	firstFrameCloseExpected bool
 	// secondTurnCloseExpected：第二个 turn 被拒（连接被 1008 关闭）。
@@ -2962,6 +2984,7 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	if tc.accountPlatform != "" {
 		account.Platform = tc.accountPlatform
 	}
+	account.RateMultiplier = tc.accountRateMultiplier
 	if strings.TrimSpace(tc.ingressMode) != "" {
 		account.Extra["openai_apikey_responses_websockets_v2_mode"] = tc.ingressMode
 	}
@@ -3050,6 +3073,12 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 		GroupID: &groupID,
 		User:    &service.User{ID: 1701, Status: service.StatusActive},
 	}
+	if tc.apiKeyService != nil {
+		h.apiKeyService = tc.apiKeyService
+		authKey, err := tc.apiKeyService.GetByKey(context.Background(), tc.apiKeyCredential)
+		require.NoError(t, err)
+		apiKey = authKey
+	}
 	if tc.simpleModeRejectAtRead > 0 {
 		apiKey.RateLimit5h = 1
 	}
@@ -3060,6 +3089,9 @@ func runOpenAIResponsesWebSocketUsageLogCase(t *testing.T, tc openAIResponsesWSU
 	router.Use(func(c *gin.Context) {
 		c.Set(string(middleware.ContextKeyAPIKey), apiKey)
 		c.Set(string(middleware.ContextKeyUser), middleware.AuthSubject{UserID: apiKey.User.ID, Concurrency: 1})
+		if tc.apiKeyService != nil && apiKey.Group != nil {
+			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), ctxkey.Group, apiKey.Group))
+		}
 		c.Next()
 	})
 	router.GET("/openai/v1/responses", h.ResponsesWebSocket)
